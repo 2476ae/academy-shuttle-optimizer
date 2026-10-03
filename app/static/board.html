@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f2b705">
   <title>셔틀 현황판</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -17,6 +19,7 @@
         <p class="sub" id="policy-line"></p>
       </div>
       <div class="chips">
+        <a class="btn small" href="/setup">기기 연결</a>
         <span id="mode" class="chip">연결 중…</span>
         <span id="clock" class="chip clock">--:--</span>
       </div>
@@ -41,7 +44,7 @@
           <h2 id="req-title">기다리거나 타고 있는 학생<span class="count" id="req-count"></span></h2>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>학원</th><th>목적지</th><th>인원</th><th>준비</th><th>상태</th><th>예정</th></tr></thead>
+              <thead><tr><th>학원</th><th>목적지</th><th>인원</th><th>메모</th><th>준비</th><th>상태</th><th>예정</th></tr></thead>
               <tbody id="req-rows"></tbody>
             </table>
           </div>
@@ -88,10 +91,12 @@
   </main>
 
   <script type="module">
-    import { connect, getJSON, h, minutes, post, renderTop, vehicleLine } from "/static/common.js";
+    import { connect, ensureSession, getJSON, h, minutes, post, renderTop, role, vehicleLine } from "/static/common.js";
 
     const $ = (id) => document.getElementById(id);
+    await ensureSession();
     const config = await getJSON("/api/config");
+    role.set({ kind: "board" });
     const stops = Object.fromEntries(config.stops.map((s) => [s.id, s]));
     const SVG = "http://www.w3.org/2000/svg";
     const s = (tag, attrs = {}, text) => {
@@ -223,6 +228,7 @@
             h("td", {}, r.branch_name),
             h("td", {}, r.dest_name),
             h("td", { class: "num" }, `${r.count}명`),
+            h("td", {}, r.note || "–"),
             h("td", { class: "num" }, r.ready_text),
             h("td", {}, h("span", { class: `pill ${r.status}` }, r.status_text)),
             h("td", { class: "num" }, describe(r)),

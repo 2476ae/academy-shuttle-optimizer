@@ -4,7 +4,7 @@ The dispatcher owns the requests and the vehicle, asks the policy what to do
 whenever the vehicle is free at a stop, and carries the decision out. The same
 class drives the simulator (``auto_drive=True``: driving and dwelling take
 their modelled time) and the live service (``auto_drive=False``: the driver
-taps 출발 and 도착).
+taps 출발 and 도착, and confirms who actually got on at each branch).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 
-from .models import CANCELLED, DONE, ONBOARD, Board, Go, Plan, Request, Step, View
+from .models import CANCELLED, DONE, NO_SHOW, ONBOARD, Board, Go, Plan, Request, Step, View
 from .models import WAITING as REQ_WAITING
 from .network import Network, format_clock
 from .policies import Policy
@@ -26,6 +26,7 @@ FREE = "free"  # at a stop, about to ask the policy
 WAIT = "waiting"  # at a stop, waiting until ``until`` (students not ready yet, or a fixed slot)
 DWELL = "dwell"  # students getting on or off, until ``until``
 READY = "ready"  # manual driving: decided where to go, waiting for the driver to leave
+BOARDING = "boarding"  # manual driving: at a branch, waiting for the driver to confirm who got on
 DRIVING = "driving"  # on the way to ``stop``, arriving at ``until``
 
 
@@ -64,6 +65,8 @@ class Dispatcher:
         self.until = now
         self.depart_at: float | None = None
         self.next_stop: str | None = None
+        self.pending_board: list[str] = []
+        self.leg_minutes = 0.0
         self.onboard: list[str] = []
         self.visit_boarded = False
         self.memory: dict = {}
@@ -101,24 +104,74 @@ class Dispatcher:
         self._note("cancel", f"{self.net.branches[req.branch].name} → {self.net.stop_name(req.dest)} {req.count}명 요청 취소", request=rid)
         return True
 
-    def driver_depart(self, now: float) -> bool:
-        """Manual driving: the driver leaves for the planned next stop."""
+    def driver_depart(self, now: float, to: str | None = None) -> bool:
+        """Manual driving: the driver leaves for the suggested stop, or for ``to`` instead."""
         self.advance(now)
-        if self.status != READY or self.next_stop is None:
+        if self.status == READY:
+            target = to or self.next_stop
+        elif self.status in (IDLE, FREE, WAIT) and to:
+            target = to
+        else:
             return False
-        self._depart(self.next_stop)
+        if target is None or target == self.stop or target not in self.net.stops:
+            return False
+        self._depart(target)
         self.advance(now)
         return True
 
-    def driver_arrive(self, now: float) -> bool:
-        """Manual driving: the driver reached the stop they were driving to."""
+    def driver_arrive(self, now: float, at: str | None = None) -> bool:
+        """Manual driving: the driver reached a stop (``at``, if not the one planned)."""
         self.advance(now)
-        if self.status != DRIVING:
+        if self.status != DRIVING or (at is not None and at not in self.net.stops):
             return False
         self.now = max(self.now, now)
         # Count the time actually driven instead of the modelled travel time.
-        if self.depart_at is not None and self.origin is not None:
-            self.driving += (self.now - self.depart_at) - self.net.travel(self.origin, self.stop)
+        if self.depart_at is not None:
+            self.driving += (self.now - self.depart_at) - self.leg_minutes
+        if at is not None and at != self.stop:
+            self._note("detour", f"계획과 다른 곳에 도착: {self.net.stop_name(at)}")
+            self.stop = at
+        self._arrive()
+        self.advance(now)
+        return True
+
+    def driver_board(self, now: float, boarded) -> bool:
+        """Manual driving: of the students the shuttle came for, these got on; the rest did not show."""
+        self.advance(now)
+        if self.status != BOARDING:
+            return False
+        chosen = set(boarded)
+        pending = [rid for rid in self.pending_board if self.requests[rid].status == REQ_WAITING]
+        got_on = [rid for rid in pending if rid in chosen]
+        for rid in pending:
+            if rid not in chosen:
+                r = self.requests[rid]
+                r.status = NO_SHOW
+                self._note(
+                    "no_show",
+                    f"미탑승: {self.net.branches[r.branch].name} → {self.net.stop_name(r.dest)} {r.count}명",
+                    request=rid,
+                )
+        self.pending_board = []
+        if got_on:
+            self._board(got_on)
+        else:
+            self.status = FREE
+            self._needs_decision = True
+            self._changed()
+        self.advance(now)
+        return True
+
+    def driver_locate(self, now: float, stop: str) -> bool:
+        """Correct where the shuttle is (e.g. at the start of the day)."""
+        self.advance(now)
+        if self.status in (DRIVING, BOARDING) or stop not in self.net.stops:
+            return False
+        self._close_visit(self.now)
+        self.origin = None
+        self.next_stop = None
+        self.stop = stop
+        self._note("locate", f"현재 위치 변경 → {self.net.stop_name(stop)}")
         self._arrive()
         self.advance(now)
         return True
@@ -229,7 +282,12 @@ class Dispatcher:
                 self._changed()
                 return
             ids = self._boardable(decision.groups)
-            if ids:
+            if ids and not self.auto_drive:
+                # The driver checks who is actually there before anyone is marked on board.
+                self.status = BOARDING
+                self.pending_board = ids
+                self._changed()
+            elif ids:
                 self._board(ids)
             else:
                 self.status = IDLE
@@ -273,8 +331,7 @@ class Dispatcher:
         self._visit.board.extend(ids)
         if self._visit.board_at is None:
             self._visit.board_at = self.now
-        self.status = DWELL
-        self.until = self.now + self.net.dwell
+        self._settle_after_stop_work()
         self._note("board", f"{self.net.stop_name(self.stop)}에서 탑승: {', '.join(names)}", requests=ids)
 
     def _start_drive(self, stop: str) -> None:
@@ -292,6 +349,7 @@ class Dispatcher:
         self.next_stop = None
         self.depart_at = self.now
         travel = self.net.travel(self.origin, stop)
+        self.leg_minutes = travel
         self.until = self.now + travel
         self.driving += travel
         self.status = DRIVING
@@ -309,14 +367,22 @@ class Dispatcher:
         self.origin = None
         if alight:
             self._visit.alight.extend(alight)
-            self.status = DWELL
-            self.until = self.now + self.net.dwell
+            self._settle_after_stop_work()
             total = sum(self.requests[rid].count for rid in alight)
             self._note("alight", f"{self.net.stop_name(self.stop)} 도착: {total}명 하차", requests=alight)
         else:
             self.status = FREE
             self._note("arrive", f"{self.net.stop_name(self.stop)} 도착")
         self._needs_decision = True
+
+    def _settle_after_stop_work(self) -> None:
+        """After students get on or off: simulated stops take ``dwell``; a real driver just moves on."""
+        if self.auto_drive:
+            self.status = DWELL
+            self.until = self.now + self.net.dwell
+        else:
+            self.status = FREE
+            self._needs_decision = True
 
     def _close_visit(self, depart: float) -> None:
         v = self._visit

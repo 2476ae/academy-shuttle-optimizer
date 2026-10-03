@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f2b705">
   <title>기사님 화면</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -24,10 +26,22 @@
     <section class="card instruction" aria-live="assertive" aria-atomic="true">
       <p class="headline" id="headline">불러오는 중…</p>
       <p class="detail" id="detail"></p>
+      <ul class="checks" id="checks" hidden aria-label="태울 학생"></ul>
       <div class="action" id="action-box" hidden>
         <button class="btn primary big" type="button" id="action"></button>
       </div>
       <p class="notice err" id="error" role="alert" hidden></p>
+      <details class="more" id="more" hidden>
+        <summary>다른 곳으로 가기 · 위치 바로잡기</summary>
+        <div class="controls">
+          <label>정류장
+            <select id="stop-pick"></select>
+          </label>
+          <button class="btn" type="button" id="go-there">이곳으로 출발</button>
+          <button class="btn" type="button" id="arrived-there">이곳에 도착했어요</button>
+          <button class="btn" type="button" id="am-there">지금 여기 있어요</button>
+        </div>
+      </details>
     </section>
 
     <section class="card" aria-labelledby="load-title">
@@ -50,25 +64,51 @@
   </main>
 
   <script type="module">
-    import { connect, h, post, renderTop } from "/static/common.js";
+    import { connect, ensureSession, getJSON, h, plainName, post, renderTop, role } from "/static/common.js";
 
     const $ = (id) => document.getElementById(id);
-    let currentAction = null;
+    await ensureSession();
+    const config = await getJSON("/api/config");
+    role.set({ kind: "driver" });
+
+    let state = null;
     let lastSpoken = "";
+    // Groups the driver unticked ("안 나왔어요"), kept while the same stop is being confirmed.
+    let missing = new Set();
+    let boardingKey = "";
+
+    const showError = (err) => {
+      $("error").textContent = err.message;
+      $("error").hidden = false;
+    };
+    const run = async (path, body) => {
+      try {
+        const next = await post(path, body);
+        $("error").hidden = true;
+        if (next?.instruction) render(next); // show the result right away, before the next live update
+      } catch (err) {
+        showError(err);
+      }
+    };
 
     $("action").addEventListener("click", async () => {
-      if (!currentAction) return;
+      const action = state?.instruction.action;
+      if (!action) return;
       $("action").disabled = true;
-      try {
-        await post(`/api/driver/${currentAction}`);
-        $("error").hidden = true;
-      } catch (err) {
-        $("error").textContent = err.message;
-        $("error").hidden = false;
-      } finally {
-        $("action").disabled = false;
+      if (action === "board") {
+        const boarded = state.vehicle.boarding.map((g) => g.id).filter((id) => !missing.has(id));
+        await run("/api/driver/board", { boarded });
+      } else {
+        await run(`/api/driver/${action}`);
       }
+      $("action").disabled = false;
     });
+
+    // Going off-plan: another stop, arriving somewhere else, or fixing the location.
+    $("stop-pick").replaceChildren(...config.stops.map((s) => h("option", { value: s.id }, s.name)));
+    $("go-there").addEventListener("click", () => run("/api/driver/depart", { to: $("stop-pick").value }));
+    $("arrived-there").addEventListener("click", () => run("/api/driver/arrive", { at: $("stop-pick").value }));
+    $("am-there").addEventListener("click", () => run("/api/driver/locate", { stop: $("stop-pick").value }));
 
     // Optional voice guidance: read out each new instruction.
     const voice = $("voice");
@@ -105,33 +145,97 @@
       return parts.join(" · ");
     };
 
-    connect((state) => {
-      renderTop(state);
-      const ins = state.instruction;
+    let checksDrawn = "";
+    const renderChecks = (v) => {
+      const groups = v.status === "boarding" ? v.boarding : [];
+      const key = `${v.stop}:${groups.map((g) => g.id).join(",")}`;
+      if (key !== boardingKey) {
+        missing = new Set();
+        boardingKey = key;
+      }
+      // Redraw only when something changed, so a tap is never lost to a live update.
+      const drawn = `${key}|${[...missing].join(",")}`;
+      if (drawn === checksDrawn) return;
+      checksDrawn = drawn;
+      $("checks").hidden = groups.length === 0;
+      $("checks").replaceChildren(
+        ...groups.map((g) => {
+          const here = !missing.has(g.id);
+          return h("li", {},
+            h("label", { class: here ? "check" : "check missing" },
+              h("input", {
+                type: "checkbox", checked: here,
+                onchange: (ev) => {
+                  // Update this row in place so focus and the tap stay where they are.
+                  const on = ev.target.checked;
+                  if (on) missing.delete(g.id); else missing.add(g.id);
+                  const label = ev.target.closest("label");
+                  label.className = on ? "check" : "check missing";
+                  label.querySelector(".state").textContent = on ? "탔어요" : "안 나왔어요";
+                  checksDrawn = `${boardingKey}|${[...missing].join(",")}`;
+                  renderAction(state);
+                },
+              }),
+              h("span", {},
+                h("span", { class: "who" }, `${g.dest_short} ${plainName(g.dest_name, g.dest_short)} · ${g.count}명`),
+                h("span", { class: "note" }, [g.branch_name, g.note].filter(Boolean).join(" · ")),
+              ),
+              h("span", { class: "state" }, here ? "탔어요" : "안 나왔어요"),
+            ),
+          );
+        }),
+      );
+    };
+
+    const renderAction = (s) => {
+      const ins = s.instruction;
+      $("action-box").hidden = !ins.action;
+      if (!ins.action) return;
+      if (ins.action === "board") {
+        const n = s.vehicle.boarding.filter((g) => !missing.has(g.id)).reduce((sum, g) => sum + g.count, 0);
+        $("action").textContent = n ? `탑승 완료 (${n}명)` : "아무도 안 탔어요";
+      } else {
+        $("action").textContent = ins.action_label;
+      }
+    };
+
+    const render = (s) => {
+      state = s;
+      renderTop(s);
+      const ins = s.instruction;
       $("headline").textContent = ins.headline;
       $("detail").textContent = ins.detail;
-      currentAction = ins.action;
-      $("action-box").hidden = !ins.action;
-      if (ins.action) $("action").textContent = ins.action_label;
       speak(`${ins.headline}. ${ins.detail}`);
+      renderChecks(s.vehicle);
+      renderAction(s);
 
-      const v = state.vehicle;
+      const v = s.vehicle;
+      $("more").hidden = !s.manual;
+      $("go-there").hidden = !["ready", "idle", "waiting", "free"].includes(v.status);
+      $("arrived-there").hidden = v.status !== "driving";
+      $("am-there").hidden = ["driving", "boarding"].includes(v.status);
+
       $("load").textContent = `${v.load} / ${v.capacity}명`;
       $("seats").replaceChildren(...Array.from({ length: v.capacity }, (_, i) => h("span", { class: i < v.load ? "seat on" : "seat" })));
       $("onboard").replaceChildren(...v.onboard.map((g) => h("li", {}, `${g.dest_name} ${g.count}명`)));
 
-      const steps = state.plan.slice(0, 8);
+      const steps = s.plan.slice(0, 8);
       $("steps-empty").hidden = steps.length > 0;
       $("steps").replaceChildren(
-        ...steps.map((s) =>
+        ...steps.map((p) =>
           h("li", {},
-            h("span", { class: "time" }, s.board_at_text ?? s.arrive_text),
-            h("span", { class: s.kind === "pickup" ? "dot pickup" : "dot", "aria-hidden": "true" }),
-            h("div", {}, h("div", { class: "stop" }, s.stop_name), h("div", { class: "what" }, what(s))),
+            h("span", { class: "time" }, p.board_at_text ?? p.arrive_text),
+            h("span", { class: p.kind === "pickup" ? "dot pickup" : "dot", "aria-hidden": "true" }),
+            h("div", {},
+              h("div", { class: "stop" }, p.stop_name),
+              h("div", { class: "what" }, what(p)),
+              ...p.board.filter((g) => g.note).map((g) => h("div", { class: "what" }, `${g.dest_short} ${g.note}`)),
+            ),
           ),
         ),
       );
-    });
+    };
+    connect(render);
   </script>
 </body>
 </html>

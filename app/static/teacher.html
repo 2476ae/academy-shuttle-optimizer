@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f2b705">
   <title>셔틀 부르기</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -20,6 +22,8 @@
         <span id="clock" class="chip clock">--:--</span>
       </div>
     </header>
+
+    <div class="banner" id="banner" role="alert" hidden><strong id="banner-title"></strong><span id="banner-sub"></span></div>
 
     <div class="strip" aria-live="polite"><span class="van" aria-hidden="true"></span><span id="vehicle">셔틀 위치를 불러오는 중…</span></div>
 
@@ -47,6 +51,10 @@
         </div>
       </div>
       <div class="field">
+        <label class="label" for="note">메모 <span class="hint">선택 · 기사님께 보여요</span></label>
+        <input class="input" id="note" type="text" maxlength="40" autocomplete="off" placeholder="예: 김OO, 이OO">
+      </div>
+      <div class="field">
         <button class="btn primary big" type="submit" id="submit">셔틀 부르기</button>
       </div>
       <p id="notice" class="notice" role="status" hidden></p>
@@ -60,16 +68,20 @@
   </main>
 
   <script type="module">
-    import { connect, getJSON, h, plainName, post, renderTop, vehicleLine } from "/static/common.js";
+    import { connect, ensureSession, getJSON, h, plainName, post, renderTop, role, signal, unlockSound, vehicleLine } from "/static/common.js";
 
+    await ensureSession();
     const config = await getJSON("/api/config");
     const params = new URLSearchParams(location.search);
     const branch = config.branches.find((b) => b.id === params.get("branch")) || config.branches[0];
     const stops = Object.fromEntries(config.stops.map((s) => [s.id, s]));
     const form = { dest: branch.destinations[0], count: 1, readyIn: 0 };
 
+    role.set({ kind: "teacher", branch: branch.id });
     document.title = `${branch.name} · 셔틀 부르기`;
     document.getElementById("title").textContent = `${branch.name} · 셔틀 부르기`;
+    // Sound needs one tap on the page before it may play.
+    document.addEventListener("pointerdown", unlockSound, { once: true });
 
     // destinations
     const destBox = document.getElementById("dests");
@@ -103,39 +115,84 @@
 
     // ready time
     const readyBox = document.getElementById("ready");
-    readyBox.addEventListener("click", (ev) => {
-      const btn = ev.target.closest("button[data-min]");
-      if (!btn) return;
+    const setReady = (btn) => {
       form.readyIn = Number(btn.dataset.min);
       for (const b of readyBox.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b === btn));
+    };
+    readyBox.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-min]");
+      if (btn) setReady(btn);
     });
 
     // submit
     const notice = document.getElementById("notice");
     const submit = document.getElementById("submit");
+    let noticeTimer = null;
+    const note = document.getElementById("note");
     document.getElementById("form").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       submit.disabled = true;
       try {
-        const r = await post("/api/requests", { branch: branch.id, dest: form.dest, count: form.count, ready_in: form.readyIn });
+        const r = await post("/api/requests", {
+          branch: branch.id, dest: form.dest, count: form.count, ready_in: form.readyIn, note: note.value,
+        });
         notice.className = "notice ok";
         notice.textContent = r.pickup_eta_text
-          ? `요청했어요. 셔틀이 ${r.pickup_eta_text}쯤 도착해요.`
+          ? `요청했어요. 셔틀이 ${r.pickup_eta_text}쯤 와요. 도착이 가까워지면 알려 드릴게요.`
           : "요청했어요. 셔틀 도착 시각을 계산하고 있어요.";
         form.count = 1;
         renderCount();
+        note.value = "";
+        setReady(readyBox.querySelector('button[data-min="0"]'));
       } catch (err) {
         notice.className = "notice err";
         notice.textContent = err.message;
       } finally {
         notice.hidden = false;
         submit.disabled = false;
+        clearTimeout(noticeTimer);
+        noticeTimer = setTimeout(() => (notice.hidden = true), 15000);
       }
     });
 
+    // "the shuttle is almost here" banner, with a vibration and chime when it first appears
+    let lastAlert = "";
+    const renderBanner = (state) => {
+      const v = state.vehicle;
+      const mine = state.requests.filter((r) => r.branch === branch.id && r.status === "waiting");
+      let kind = null;
+      let title = "";
+      let sub = "";
+      if (mine.length) {
+        const boardingMine = v.status === "boarding" && v.boarding.some((g) => g.branch === branch.id);
+        const parkedHere = v.stop === branch.stop && ["waiting", "ready", "idle", "free", "dwell"].includes(v.status)
+          && mine.some((r) => r.pickup_eta !== null && r.pickup_eta <= state.now + 1);
+        const comingHere = v.status === "driving" && v.stop === branch.stop
+          && mine.some((r) => r.pickup_eta !== null && r.pickup_eta <= v.until + 1.5);
+        const minsLeft = Math.max(0, Math.round(v.until - state.now));
+        if (boardingMine || parkedHere) {
+          kind = "here";
+          title = "셔틀이 도착했어요";
+          sub = "학생을 내보내 주세요";
+        } else if (comingHere && minsLeft <= 3) {
+          kind = "soon";
+          title = minsLeft <= 0 ? "셔틀이 곧 도착해요" : `셔틀이 ${minsLeft}분 뒤 도착해요`;
+          sub = "학생이 나갈 준비를 해 주세요";
+        }
+      }
+      const banner = document.getElementById("banner");
+      banner.hidden = !kind;
+      banner.className = `banner ${kind || ""}`;
+      document.getElementById("banner-title").textContent = title;
+      document.getElementById("banner-sub").textContent = sub;
+      const key = kind ? `${kind}:${mine.map((r) => r.id).join(",")}` : "";
+      if (key && key !== lastAlert) signal();
+      lastAlert = key;
+    };
+
     // list
     const list = document.getElementById("list");
-    const rank = { onboard: 0, waiting: 1, done: 2, cancelled: 3 };
+    const rank = { onboard: 0, waiting: 1, no_show: 2, done: 3, cancelled: 4 };
     const describe = (r) => {
       if (r.status === "waiting") {
         const eta = r.pickup_eta_text ? `셔틀 ${r.pickup_eta_text} 도착 예정` : "도착 시각 계산 중";
@@ -143,6 +200,7 @@
       }
       if (r.status === "onboard") return `${r.picked_text} 탑승 · ${r.drop_eta_text ?? "–"} 도착 예정`;
       if (r.status === "done") return `${r.picked_text} 탑승 · ${r.dropped_text} 도착`;
+      if (r.status === "no_show") return "셔틀이 왔지만 타지 않았어요. 필요하면 다시 불러 주세요.";
       return `준비 ${r.ready_text} · 취소됨`;
     };
     const cancel = async (id) => {
@@ -161,6 +219,7 @@
             h("span", { class: "dest", "aria-hidden": "true" }, r.dest_short),
             h("div", { class: "main" },
               h("div", { class: "title" }, `${plainName(r.dest_name, r.dest_short)} · ${r.count}명 `, h("span", { class: `pill ${r.status}` }, r.status_text)),
+              r.note ? h("div", { class: "meta" }, r.note) : null,
               h("div", { class: "meta" }, describe(r)),
             ),
             r.status === "waiting"
@@ -174,6 +233,7 @@
     connect((state) => {
       renderTop(state);
       document.getElementById("vehicle").textContent = `셔틀 · ${vehicleLine(state)}`;
+      renderBanner(state);
       renderList(state);
     });
   </script>

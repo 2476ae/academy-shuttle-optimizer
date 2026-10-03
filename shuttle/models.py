@@ -12,6 +12,7 @@ WAITING = "waiting"
 ONBOARD = "onboard"
 DONE = "done"
 CANCELLED = "cancelled"
+NO_SHOW = "no_show"  # the shuttle came but the students did not get on
 
 
 @dataclass
@@ -28,6 +29,7 @@ class Request:
     status: str = WAITING
     picked_at: float | None = None
     dropped_at: float | None = None
+    note: str = ""  # optional, e.g. students' names for the driver
 
     @property
     def wait(self) -> float | None:

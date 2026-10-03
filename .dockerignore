@@ -1,0 +1,9 @@
+.git
+.venv
+venv
+var
+tests
+docs
+**/__pycache__
+*.egg-info
+shuttle.local.json

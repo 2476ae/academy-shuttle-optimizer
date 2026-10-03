@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f2b705">
   <title>하원 셔틀</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -23,6 +25,11 @@
 
     <div class="strip" aria-live="polite"><span class="van" aria-hidden="true"></span><span id="vehicle">셔틀 위치를 불러오는 중…</span></div>
 
+    <section id="mine-box" hidden aria-labelledby="mine-title">
+      <h2 id="mine-title" class="label" style="margin:0 0 8px">이 기기에서 쓰던 화면</h2>
+      <div class="roles"><a class="role" id="mine" href="/"></a></div>
+    </section>
+
     <section aria-labelledby="teachers">
       <h2 id="teachers" class="label" style="margin:0 0 8px">선생님</h2>
       <div class="roles" id="branches"></div>
@@ -39,15 +46,21 @@
           <strong><span class="tag" style="background:var(--ink-2)"></span>현황판</strong>
           <span>셔틀 위치, 기다리는 학생, 오늘의 대기 시간을 봅니다.</span>
         </a>
+        <a class="role" href="/setup">
+          <strong><span class="tag" style="background:var(--drop)"></span>기기 연결</strong>
+          <span>선생님·기사님 휴대폰에 맞는 화면을 QR 코드로 엽니다.</span>
+        </a>
       </div>
     </section>
   </main>
 
   <script type="module">
-    import { connect, getJSON, h, renderTop, vehicleLine } from "/static/common.js";
+    import { connect, ensureSession, getJSON, h, renderTop, role, vehicleLine } from "/static/common.js";
 
+    await ensureSession();
     const config = await getJSON("/api/config");
     const names = Object.fromEntries(config.stops.map((s) => [s.id, s]));
+    const branchName = Object.fromEntries(config.branches.map((b) => [b.id, `${b.name} · ${b.level}`]));
     document.getElementById("branches").replaceChildren(
       ...config.branches.map((b) =>
         h("a", { class: "role", href: `/teacher?branch=${encodeURIComponent(b.id)}` },
@@ -56,6 +69,23 @@
         ),
       ),
     );
+
+    // Offer the screen this device used last time first.
+    const last = role.get();
+    const mine = last?.kind === "teacher" && branchName[last.branch]
+      ? { href: `/teacher?branch=${encodeURIComponent(last.branch)}`, title: `${branchName[last.branch]} 선생님`, sub: "셔틀 부르기" }
+      : last?.kind === "driver" ? { href: "/driver", title: "기사님 화면", sub: "다음 할 일 안내" }
+      : last?.kind === "board" ? { href: "/board", title: "현황판", sub: "셔틀 위치와 오늘 기록" }
+      : null;
+    if (mine) {
+      const a = document.getElementById("mine");
+      a.href = mine.href;
+      a.replaceChildren(
+        h("strong", {}, h("span", { class: "tag", style: "background:var(--accent)" }), mine.title),
+        h("span", {}, `${mine.sub} · 바로 열기`),
+      );
+      document.getElementById("mine-box").hidden = false;
+    }
 
     connect((state) => {
       renderTop(state);

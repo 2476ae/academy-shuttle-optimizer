@@ -5,7 +5,7 @@ import pytest
 
 from shuttle import Dispatcher, Request, default_network, make_policy
 from shuttle.demand import DemandModel, generate_day
-from shuttle.dispatcher import DRIVING, READY
+from shuttle.dispatcher import BOARDING, DRIVING, READY
 from shuttle.simulate import run_day
 
 NET = default_network()
@@ -80,8 +80,12 @@ def test_cancelled_request_is_not_served():
     assert all("a" not in s.board for s in d.visits)
 
 
+def manual(start_stop="A"):
+    return Dispatcher(NET, make_policy("optimized", NET), now=T0, start_stop=start_stop, auto_drive=False)
+
+
 def test_manual_driving_waits_for_the_driver():
-    d = Dispatcher(NET, make_policy("optimized", NET), now=T0, start_stop="A", auto_drive=False)
+    d = manual()
     d.add_request(req("b", "B", "D2", 2))
     d.advance(T0 + 30)
     assert d.status == READY and d.next_stop == "BC"
@@ -89,8 +93,49 @@ def test_manual_driving_waits_for_the_driver():
     d.advance(T0 + 36)  # past the modelled 5 minutes
     assert d.status == DRIVING  # still driving until the driver says they arrived
     assert d.driver_arrive(T0 + 37)
-    assert d.requests["b"].status == "onboard"
     assert d.driving == pytest.approx(7)  # actual minutes driven, not the model's 5
+    # Nobody is on board until the driver confirms it.
+    assert d.status == BOARDING and d.pending_board == ["b"]
+    assert d.requests["b"].status == "waiting"
+    assert d.driver_board(T0 + 38, ["b"])
+    assert d.requests["b"].status == "onboard"
+    assert d.status == READY and d.next_stop == "D2"  # no dwell timer for a real driver
+    assert d.driver_depart(T0 + 38)
+    assert d.driver_arrive(T0 + 44)
+    assert d.requests["b"].status == "done" and d.requests["b"].dropped_at == pytest.approx(T0 + 44)
+
+
+def test_students_who_do_not_show_are_marked_and_dropped_from_the_plan():
+    d = manual(start_stop="BC")
+    d.add_request(req("here", "B", "D2", 1))
+    d.add_request(req("gone", "C", "D3", 2))
+    d.advance(T0)
+    assert d.status == BOARDING and set(d.pending_board) == {"here", "gone"}
+    assert d.driver_board(T0 + 1, ["here"])
+    assert d.requests["gone"].status == "no_show"
+    assert d.requests["here"].status == "onboard"
+    assert all("gone" not in s.board + s.alight for s in d.plan().steps)
+    assert not d.driver_board(T0 + 1, ["gone"])  # nothing left to confirm
+
+
+def test_driver_can_go_somewhere_else_and_arrive_elsewhere():
+    d = manual()
+    d.add_request(req("b", "B", "D2", 1))
+    d.advance(T0)
+    assert d.next_stop == "BC"
+    assert d.driver_depart(T0, to="D1")  # e.g. a fuel stop or a detour
+    assert d.stop == "D1"
+    assert d.driver_arrive(T0 + 6, at="D4")  # ended up somewhere else
+    assert d.stop == "D4" and d.status == READY and d.next_stop == "BC"
+
+
+def test_driver_can_correct_the_location():
+    d = manual()
+    d.add_request(req("b", "B", "D2", 1))
+    d.advance(T0)
+    assert d.driver_locate(T0, "BC")  # the van was actually parked at B·C
+    assert d.status == BOARDING and d.pending_board == ["b"]
+    assert not d.driver_locate(T0, "A")  # not while confirming who got on
 
 
 def test_run_day_reports_every_student():
