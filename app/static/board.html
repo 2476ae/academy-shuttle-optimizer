@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f2b705">
+  <title>셔틀 현황판</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="wrap">
+    <header class="top">
+      <div>
+        <a class="back" href="/">← 처음으로</a>
+        <h1>셔틀 현황판</h1>
+        <p class="sub" id="policy-line"></p>
+      </div>
+      <div class="chips">
+        <span id="mode" class="chip">연결 중…</span>
+        <span id="clock" class="chip clock">--:--</span>
+      </div>
+    </header>
+
+    <div class="tiles" aria-live="polite">
+      <div class="tile"><div class="k">집에 데려다준 학생</div><div class="v" id="t-served">0<small>명</small></div></div>
+      <div class="tile"><div class="k">기다리는 학생</div><div class="v" id="t-waiting">0<small>명</small></div></div>
+      <div class="tile"><div class="k">평균 대기</div><div class="v" id="t-wait">–<small>분</small></div></div>
+      <div class="tile"><div class="k">평균 귀가 시간</div><div class="v" id="t-total">–<small>분</small></div></div>
+      <div class="tile"><div class="k">운전 시간</div><div class="v" id="t-drive">0<small>분</small></div></div>
+    </div>
+
+    <div class="board-grid">
+      <div style="display:grid;gap:16px;min-width:0">
+        <section class="card" aria-labelledby="map-title">
+          <h2 id="map-title">셔틀 위치</h2>
+          <p class="muted small" id="vehicle" style="margin:-6px 0 8px"></p>
+          <div class="map-scroll"><div class="map-box"><svg id="map" viewBox="0 0 960 452" role="img" aria-label="정류장과 셔틀 위치 개념도"></svg></div></div>
+        </section>
+        <section class="card" aria-labelledby="req-title">
+          <h2 id="req-title">기다리거나 타고 있는 학생<span class="count" id="req-count"></span></h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>학원</th><th>목적지</th><th>인원</th><th>준비</th><th>상태</th><th>예정</th></tr></thead>
+              <tbody id="req-rows"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="req-empty">지금은 기다리는 학생이 없어요.</p>
+        </section>
+      </div>
+      <div style="display:grid;gap:16px;min-width:0">
+        <section class="card" aria-labelledby="plan-title">
+          <h2 id="plan-title">운행 계획</h2>
+          <ol class="steps" id="steps"></ol>
+          <p class="empty" id="steps-empty">예정된 운행이 없어요.</p>
+        </section>
+        <section class="card" aria-labelledby="log-title">
+          <h2 id="log-title">기록</h2>
+          <ul class="log" id="log"></ul>
+        </section>
+      </div>
+    </div>
+
+    <section class="card" id="demo" hidden aria-labelledby="demo-title">
+      <h2 id="demo-title">시연 설정</h2>
+      <div class="controls">
+        <label>운행 규칙
+          <select id="policy"></select>
+        </label>
+        <label>속도
+          <select id="speed">
+            <option value="10">10배속</option>
+            <option value="30">30배속</option>
+            <option value="60">60배속</option>
+            <option value="120">120배속</option>
+          </select>
+        </label>
+        <label>가상 요청
+          <select id="auto">
+            <option value="1">켜기</option>
+            <option value="0">끄기</option>
+          </select>
+        </label>
+        <button class="btn" type="button" id="reset">이 설정으로 처음부터</button>
+      </div>
+      <p class="muted small" style="margin:10px 0 0">가상 요청을 켜면 선생님 대신 가상의 요청이 들어옵니다. 같은 시각에 다른 탭에서 직접 셔틀을 불러도 됩니다.</p>
+    </section>
+  </main>
+
+  <script type="module">
+    import { connect, getJSON, h, minutes, post, renderTop, vehicleLine } from "/static/common.js";
+
+    const $ = (id) => document.getElementById(id);
+    const config = await getJSON("/api/config");
+    const stops = Object.fromEntries(config.stops.map((s) => [s.id, s]));
+    const SVG = "http://www.w3.org/2000/svg";
+    const s = (tag, attrs = {}, text) => {
+      const node = document.createElementNS(SVG, tag);
+      for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+      if (text !== undefined) node.textContent = text;
+      return node;
+    };
+
+    // demo controls
+    $("policy").replaceChildren(...config.policies.map((p) => h("option", { value: p.name }, p.label)));
+    let controlsFilled = false;
+    $("reset").addEventListener("click", async () => {
+      $("reset").disabled = true;
+      try {
+        await post("/api/demo/reset", {
+          policy: $("policy").value,
+          speed: Number($("speed").value),
+          demo_requests: $("auto").value === "1",
+        });
+      } finally {
+        $("reset").disabled = false;
+      }
+    });
+
+    // static part of the map: roads between neighbouring stops, then the stops
+    const map = $("map");
+    const roads = s("g", { stroke: "var(--line)", "stroke-width": "4", "stroke-linecap": "round" });
+    const roadLabels = s("g", { "font-size": "21", "font-weight": "600", fill: "var(--ink-3)", "text-anchor": "middle" });
+    const edges = [["A", "BC"], ["A", "D1"], ["BC", "D1"], ["A", "D2"], ["BC", "D3"], ["BC", "D4"]];
+    for (const [a, b] of edges) {
+      if (!stops[a] || !stops[b]) continue;
+      const [x1, y1] = stops[a].pos, [x2, y2] = stops[b].pos;
+      roads.append(s("line", { x1, y1, x2, y2 }));
+      // label beside the middle of the road, on its upper side
+      const len = Math.hypot(x2 - x1, y2 - y1) || 1;
+      let nx = -(y2 - y1) / len, ny = (x2 - x1) / len;
+      if (ny > 0) { nx = -nx; ny = -ny; }
+      roadLabels.append(s("text", { x: (x1 + x2) / 2 + nx * 20, y: (y1 + y2) / 2 + ny * 20 + 7 }, `${config.minutes[a][b]}분`));
+    }
+    map.append(roads, roadLabels);
+    const route = s("polyline", { fill: "none", stroke: "var(--accent)", "stroke-width": "4", "stroke-dasharray": "2 8", "stroke-linecap": "round" });
+    map.append(route);
+    const badges = {};
+    for (const st of config.stops) {
+      const [x, y] = st.pos;
+      const g = s("g", { transform: `translate(${x},${y})` });
+      if (st.kind === "pickup") g.append(s("rect", { x: -22, y: -22, width: 44, height: 44, rx: 9, fill: "var(--academy)", stroke: "var(--surface)", "stroke-width": "3" }));
+      else g.append(s("circle", { r: 21, fill: "var(--drop)", stroke: "var(--surface)", "stroke-width": "3" }));
+      g.append(s("text", { y: 7, "text-anchor": "middle", "font-size": st.short.length > 1 ? "15" : "20", "font-weight": "800", fill: "#fff" }, st.short));
+      g.append(s("text", { y: 54, "text-anchor": "middle", "font-size": "24", "font-weight": "700", fill: "var(--ink)" }, st.name));
+      const badge = s("g", { transform: "translate(24,-34)", visibility: "hidden" });
+      badge.append(s("rect", { x: 0, y: -16, width: 58, height: 28, rx: 14, fill: "var(--accent)" }));
+      const label = s("text", { x: 29, y: 4, "text-anchor": "middle", "font-size": "17", "font-weight": "800", fill: "var(--accent-ink)" });
+      badge.append(label);
+      g.append(badge);
+      badges[st.id] = { badge, label };
+      map.append(g);
+    }
+    const van = s("g", {});
+    van.append(s("rect", { x: -30, y: -18, width: 60, height: 36, rx: 9, fill: "var(--accent)", stroke: "var(--ink)", "stroke-width": "2.5" }));
+    const vanText = s("text", { y: 7, "text-anchor": "middle", "font-size": "18", "font-weight": "800", fill: "var(--accent-ink)" }, "0");
+    van.append(vanText);
+    map.append(van);
+
+    const vanPos = (v) => {
+      const at = stops[v.stop].pos;
+      if (v.status === "driving" && v.origin && v.progress !== null) {
+        const from = stops[v.origin].pos;
+        return [from[0] + (at[0] - from[0]) * v.progress, from[1] + (at[1] - from[1]) * v.progress];
+      }
+      return [at[0] - 52, at[1] - 30];
+    };
+
+    const describe = (r) => {
+      if (r.status === "waiting") return r.pickup_eta_text ? `${r.pickup_eta_text} 탑승` : "계산 중";
+      return r.drop_eta_text ? `${r.drop_eta_text} 도착` : "–";
+    };
+    const what = (step) => {
+      const parts = [];
+      if (step.alight_count) parts.push(`${step.alight_count}명 내리기`);
+      if (step.board_count) parts.push(`${step.board_count}명 태우기`);
+      return parts.join(" · ");
+    };
+
+    connect((state) => {
+      renderTop(state);
+      $("policy-line").textContent = `운행 규칙: ${state.policy.label}`;
+      $("demo").hidden = state.mode !== "demo";
+      if (!controlsFilled) {
+        $("policy").value = state.policy.name;
+        $("speed").value = String(state.speed);
+        $("auto").value = state.demo_requests ? "1" : "0";
+        controlsFilled = true;
+      }
+
+      const st = state.stats;
+      $("t-served").replaceChildren(`${st.served}`, h("small", {}, "명"));
+      $("t-waiting").replaceChildren(`${st.waiting}`, h("small", {}, "명"));
+      $("t-wait").replaceChildren(minutes(st.avg_wait), h("small", {}, "분"));
+      $("t-total").replaceChildren(minutes(st.avg_total), h("small", {}, "분"));
+      $("t-drive").replaceChildren(minutes(st.driving), h("small", {}, "분"));
+
+      // map
+      const v = state.vehicle;
+      $("vehicle").textContent = `셔틀 · ${vehicleLine(state)} · 차 안 ${v.load}/${v.capacity}명`;
+      const [vx, vy] = vanPos(v);
+      van.setAttribute("transform", `translate(${vx},${vy})`);
+      vanText.textContent = `${v.load}명`;
+      const pts = [[vx, vy], ...state.plan.map((p) => stops[p.stop].pos)];
+      route.setAttribute("points", pts.map((p) => p.join(",")).join(" "));
+      const waitingAt = {};
+      for (const r of state.requests) if (r.status === "waiting") waitingAt[r.pickup] = (waitingAt[r.pickup] || 0) + r.count;
+      for (const [id, b] of Object.entries(badges)) {
+        const n = waitingAt[id] || 0;
+        b.badge.setAttribute("visibility", n ? "visible" : "hidden");
+        b.label.textContent = `${n}명`;
+      }
+
+      // requests
+      const active = state.requests
+        .filter((r) => r.status === "waiting" || r.status === "onboard")
+        .sort((a, b) => a.ready_at - b.ready_at);
+      $("req-count").textContent = active.length ? `${active.length}건` : "";
+      $("req-empty").hidden = active.length > 0;
+      $("req-rows").replaceChildren(
+        ...active.map((r) =>
+          h("tr", {},
+            h("td", {}, r.branch_name),
+            h("td", {}, r.dest_name),
+            h("td", { class: "num" }, `${r.count}명`),
+            h("td", { class: "num" }, r.ready_text),
+            h("td", {}, h("span", { class: `pill ${r.status}` }, r.status_text)),
+            h("td", { class: "num" }, describe(r)),
+          ),
+        ),
+      );
+
+      // plan
+      const steps = state.plan.slice(0, 10);
+      $("steps-empty").hidden = steps.length > 0;
+      $("steps").replaceChildren(
+        ...steps.map((p) =>
+          h("li", {},
+            h("span", { class: "time" }, p.board_at_text ?? p.arrive_text),
+            h("span", { class: p.kind === "pickup" ? "dot pickup" : "dot", "aria-hidden": "true" }),
+            h("div", {}, h("div", { class: "stop" }, p.stop_name), h("div", { class: "what" }, what(p))),
+          ),
+        ),
+      );
+
+      // log
+      $("log").replaceChildren(...state.log.slice(0, 30).map((e) => h("li", {}, h("span", { class: "t" }, e.clock), h("span", {}, e.text))));
+    });
+  </script>
+</body>
+</html>

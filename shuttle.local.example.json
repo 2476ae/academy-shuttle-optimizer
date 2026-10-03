@@ -1,0 +1,17 @@
+{
+  "capacity": 8,
+  "service_start": "15:00",
+  "service_end": "21:30",
+  "stops": {
+    "A": { "name": "학원 A" },
+    "BC": { "name": "학원 B·C" },
+    "D1": { "name": "① OO리" },
+    "D2": { "name": "② OO아파트" },
+    "D3": { "name": "③ OO아파트" },
+    "D4": { "name": "④ OO아파트" }
+  },
+  "minutes": [
+    ["BC", "D3", 3],
+    ["A", "D4", 4]
+  ]
+}

@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f2b705">
+  <title>셔틀 부르기</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="wrap" style="max-width:640px">
+    <header class="top">
+      <div>
+        <a class="back" href="/">← 처음으로</a>
+        <h1 id="title">셔틀 부르기</h1>
+      </div>
+      <div class="chips">
+        <span id="mode" class="chip">연결 중…</span>
+        <span id="clock" class="chip clock">--:--</span>
+      </div>
+    </header>
+
+    <div class="strip" aria-live="polite"><span class="van" aria-hidden="true"></span><span id="vehicle">셔틀 위치를 불러오는 중…</span></div>
+
+    <form id="form" class="card" novalidate>
+      <h2>셔틀 부르기</h2>
+      <div class="field">
+        <span class="label" id="dest-label">목적지</span>
+        <div class="choices" id="dests" role="group" aria-labelledby="dest-label"></div>
+      </div>
+      <div class="field">
+        <span class="label" id="count-label">인원</span>
+        <div class="stepper" role="group" aria-labelledby="count-label">
+          <button type="button" id="minus" aria-label="한 명 빼기">−</button>
+          <output id="count" aria-live="polite">1</output>
+          <button type="button" id="plus" aria-label="한 명 더하기">+</button>
+        </div>
+      </div>
+      <div class="field">
+        <span class="label" id="ready-label">학생이 준비되는 시각</span>
+        <div class="seg" id="ready" role="group" aria-labelledby="ready-label">
+          <button type="button" data-min="0" aria-pressed="true">지금</button>
+          <button type="button" data-min="5" aria-pressed="false">5분 뒤</button>
+          <button type="button" data-min="10" aria-pressed="false">10분 뒤</button>
+          <button type="button" data-min="15" aria-pressed="false">15분 뒤</button>
+        </div>
+      </div>
+      <div class="field">
+        <button class="btn primary big" type="submit" id="submit">셔틀 부르기</button>
+      </div>
+      <p id="notice" class="notice" role="status" hidden></p>
+    </form>
+
+    <section class="card" aria-labelledby="list-title">
+      <h2 id="list-title">오늘 요청<span class="count" id="list-count"></span></h2>
+      <ul class="rows" id="list"></ul>
+      <p class="empty" id="empty">아직 요청이 없어요.</p>
+    </section>
+  </main>
+
+  <script type="module">
+    import { connect, getJSON, h, plainName, post, renderTop, vehicleLine } from "/static/common.js";
+
+    const config = await getJSON("/api/config");
+    const params = new URLSearchParams(location.search);
+    const branch = config.branches.find((b) => b.id === params.get("branch")) || config.branches[0];
+    const stops = Object.fromEntries(config.stops.map((s) => [s.id, s]));
+    const form = { dest: branch.destinations[0], count: 1, readyIn: 0 };
+
+    document.title = `${branch.name} · 셔틀 부르기`;
+    document.getElementById("title").textContent = `${branch.name} · 셔틀 부르기`;
+
+    // destinations
+    const destBox = document.getElementById("dests");
+    const renderDests = () => {
+      destBox.replaceChildren(
+        ...branch.destinations.map((id) =>
+          h("button", {
+            type: "button", class: "choice", "aria-pressed": String(form.dest === id),
+            onclick: () => { form.dest = id; renderDests(); },
+          },
+            h("span", { class: "big" }, stops[id].short),
+            h("span", { class: "name" }, plainName(stops[id].name, stops[id].short)),
+          ),
+        ),
+      );
+    };
+    renderDests();
+
+    // count
+    const countOut = document.getElementById("count");
+    const minus = document.getElementById("minus");
+    const plus = document.getElementById("plus");
+    const renderCount = () => {
+      countOut.textContent = form.count;
+      minus.disabled = form.count <= 1;
+      plus.disabled = form.count >= config.capacity;
+    };
+    minus.onclick = () => { form.count = Math.max(1, form.count - 1); renderCount(); };
+    plus.onclick = () => { form.count = Math.min(config.capacity, form.count + 1); renderCount(); };
+    renderCount();
+
+    // ready time
+    const readyBox = document.getElementById("ready");
+    readyBox.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-min]");
+      if (!btn) return;
+      form.readyIn = Number(btn.dataset.min);
+      for (const b of readyBox.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b === btn));
+    });
+
+    // submit
+    const notice = document.getElementById("notice");
+    const submit = document.getElementById("submit");
+    document.getElementById("form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      submit.disabled = true;
+      try {
+        const r = await post("/api/requests", { branch: branch.id, dest: form.dest, count: form.count, ready_in: form.readyIn });
+        notice.className = "notice ok";
+        notice.textContent = r.pickup_eta_text
+          ? `요청했어요. 셔틀이 ${r.pickup_eta_text}쯤 도착해요.`
+          : "요청했어요. 셔틀 도착 시각을 계산하고 있어요.";
+        form.count = 1;
+        renderCount();
+      } catch (err) {
+        notice.className = "notice err";
+        notice.textContent = err.message;
+      } finally {
+        notice.hidden = false;
+        submit.disabled = false;
+      }
+    });
+
+    // list
+    const list = document.getElementById("list");
+    const rank = { onboard: 0, waiting: 1, done: 2, cancelled: 3 };
+    const describe = (r) => {
+      if (r.status === "waiting") {
+        const eta = r.pickup_eta_text ? `셔틀 ${r.pickup_eta_text} 도착 예정` : "도착 시각 계산 중";
+        return `준비 ${r.ready_text} · ${eta}`;
+      }
+      if (r.status === "onboard") return `${r.picked_text} 탑승 · ${r.drop_eta_text ?? "–"} 도착 예정`;
+      if (r.status === "done") return `${r.picked_text} 탑승 · ${r.dropped_text} 도착`;
+      return `준비 ${r.ready_text} · 취소됨`;
+    };
+    const cancel = async (id) => {
+      try { await post(`/api/requests/${encodeURIComponent(id)}/cancel`); }
+      catch (err) { notice.className = "notice err"; notice.textContent = err.message; notice.hidden = false; }
+    };
+    const renderList = (state) => {
+      const mine = state.requests
+        .filter((r) => r.branch === branch.id)
+        .sort((a, b) => rank[a.status] - rank[b.status] || b.created_at - a.created_at);
+      document.getElementById("list-count").textContent = mine.length ? `${mine.length}건` : "";
+      document.getElementById("empty").hidden = mine.length > 0;
+      list.replaceChildren(
+        ...mine.map((r) =>
+          h("li", { class: `row ${r.status}` },
+            h("span", { class: "dest", "aria-hidden": "true" }, r.dest_short),
+            h("div", { class: "main" },
+              h("div", { class: "title" }, `${plainName(r.dest_name, r.dest_short)} · ${r.count}명 `, h("span", { class: `pill ${r.status}` }, r.status_text)),
+              h("div", { class: "meta" }, describe(r)),
+            ),
+            r.status === "waiting"
+              ? h("button", { class: "btn small danger", type: "button", onclick: () => cancel(r.id) }, "취소")
+              : h("span"),
+          ),
+        ),
+      );
+    };
+
+    connect((state) => {
+      renderTop(state);
+      document.getElementById("vehicle").textContent = `셔틀 · ${vehicleLine(state)}`;
+      renderList(state);
+    });
+  </script>
+</body>
+</html>
